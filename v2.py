@@ -87,21 +87,38 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, n_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(n_heads)])
+        self.proj = nn.Linear(n_embeds, n_embeds)
 
     def forward(self, x):
-        return torch.cat([h(x) for h in self.heads], dim=-1)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.proj(out)
+        return out
     
 class FeedForward(nn.Module):
     """A simple linear layer followed by a non-linearity"""
-    def __init__(self):
+    def __init__(self, n_embeds):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embeds, n_embeds),
+            nn.Linear(n_embeds, 4 * n_embeds),
             nn.ReLU(),
+            nn.Linear(4 * n_embeds, n_embeds)
         )
 
     def forward(self, x):
         return self.net(x)
+    
+class Block(nn.Module):
+    """Transformer block"""
+    def __init__(self, n_embeds, n_heads):
+        super().__init__()
+        head_size = n_embeds // n_heads
+        self.sa = MultiHeadAttention(n_heads, head_size)
+        self.ffwd = FeedForward(n_embeds)
+
+    def forward(self, x):
+        x = x + self.sa(x)
+        x = x + self.ffwd(x)
+        return x
 
 # Simple bigram model
 class BigramLanguageModel(nn.Module):
@@ -110,7 +127,11 @@ class BigramLanguageModel(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size, n_embeds)
         self.position_embedding_table = nn.Embedding(block_size, n_embeds)
         self.sa_heads = MultiHeadAttention(4, n_embeds//4)
-        self.ffwd = FeedForward(n_embeds)
+        self.blocks = nn.Sequential(
+            Block(n_embeds, n_heads=4),
+            Block(n_embeds, n_heads=4),
+            Block(n_embeds, n_heads=4),
+        )
         self.lm_head = nn.Linear(n_embeds, vocab_size)
     
     def forward(self, idx, targets=None):
@@ -119,7 +140,7 @@ class BigramLanguageModel(nn.Module):
         position_embeds = self.position_embedding_table(torch.arange(T, device=device)) # T, n_embeds
         x = token_embeds + position_embeds # (B, T, n_embeds)
         x = self.sa_heads(x) # apply one head of self-attention. (B, T, n_embeds)
-        x = self.ffwd(x) # (B, T, n_embeds)
+        x = self.blocks(x) # (B, T, n_embeds)
         logits = self.lm_head(x) # (B, T, vocab_size)
 
         if targets is None:
