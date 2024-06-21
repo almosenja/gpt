@@ -5,11 +5,12 @@ from torch.nn import functional as F
 # Hyperparameters
 batch_size = 32
 block_size = 8
-max_iters = 3000
+max_iters = 5000
 eval_interval = 300
-lr = 1e-2
+lr = 1e-3
 device = "cuda" if torch.cuda.is_available() else "cpu"
 eval_iters = 200
+n_embeds = 32
 
 torch.manual_seed(1337)
 
@@ -51,20 +52,76 @@ def estimate_loss():
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
-            logits, loss = model.forward(X, Y)
+            logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
     return out
 
+class Head(nn.Module):
+    """One head of self-attention"""
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embeds, head_size, bias=False)
+        self.query = nn.Linear(n_embeds, head_size, bias=False)
+        self.value = nn.Linear(n_embeds, head_size, bias=False)
+        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+
+    def forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x)   # (B, T, C)
+        q = self.query(x) # (B, T, C)
+        v = self.value(x) # (B, T, C)
+
+        # Compute attention scores
+        wei = q @ k.transpose(-2, -1) * C**-0.5 # (B, T, C) @ (B, C, T) -> (B, T, T)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf")) # (B, T, T)
+        wei = F.softmax(wei, dim=-1) # (B, T, T)
+
+        # Perform the weighted aggregation of the values
+        out = wei @ v # (B, T, T) @ (B, T, C) -> (B, T, C))
+        return out
+    
+class MultiHeadAttention(nn.Module):
+    """Multiple heads of self-attention in parallel"""
+    def __init__(self, n_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(n_heads)])
+
+    def forward(self, x):
+        return torch.cat([h(x) for h in self.heads], dim=-1)
+    
+class FeedForward(nn.Module):
+    """A simple linear layer followed by a non-linearity"""
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embeds, n_embeds),
+            nn.ReLU(),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
 # Simple bigram model
 class BigramLanguageModel(nn.Module):
-    def __init__(self, vocab_size):
+    def __init__(self):
         super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embeds)
+        self.position_embedding_table = nn.Embedding(block_size, n_embeds)
+        self.sa_heads = MultiHeadAttention(4, n_embeds//4)
+        self.ffwd = FeedForward(n_embeds)
+        self.lm_head = nn.Linear(n_embeds, vocab_size)
     
     def forward(self, idx, targets=None):
-        logits = self.token_embedding_table(idx)
+        B, T = idx.shape
+        token_embeds = self.token_embedding_table(idx) # (B, T, n_embeds)
+        position_embeds = self.position_embedding_table(torch.arange(T, device=device)) # T, n_embeds
+        x = token_embeds + position_embeds # (B, T, n_embeds)
+        x = self.sa_heads(x) # apply one head of self-attention. (B, T, n_embeds)
+        x = self.ffwd(x) # (B, T, n_embeds)
+        logits = self.lm_head(x) # (B, T, vocab_size)
+
         if targets is None:
             loss = None
         else:
@@ -76,14 +133,15 @@ class BigramLanguageModel(nn.Module):
     
     def generate(self, idx, max_new_tokens):
         for _ in range(max_new_tokens):
-            logits, loss = self(idx)
+            idx_cond = idx[:, -block_size:]
+            logits, loss = self(idx_cond)
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
     
-model = BigramLanguageModel(vocab_size).to(device)
+model = BigramLanguageModel().to(device)
 
 # Create an optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
@@ -98,7 +156,7 @@ for iter in range(max_iters):
     xb, yb = get_batch("train")
     
     # Evaluate the loss
-    logits, loss = model.forward(xb, yb)
+    logits, loss = model(xb, yb)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
