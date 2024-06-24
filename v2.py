@@ -3,14 +3,17 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 # Hyperparameters
-batch_size = 32
-block_size = 8
+batch_size = 64
+block_size = 256
 max_iters = 5000
-eval_interval = 300
-lr = 1e-3
+eval_interval = 500
+lr = 3e-4
 device = "cuda" if torch.cuda.is_available() else "cpu"
 eval_iters = 200
-n_embeds = 32
+n_embeds = 384
+n_heads = 6
+n_layers = 6
+dropout_prob = 0.2
 
 torch.manual_seed(1337)
 
@@ -66,6 +69,7 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embeds, head_size, bias=False)
         self.value = nn.Linear(n_embeds, head_size, bias=False)
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout_prob)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -77,7 +81,7 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2, -1) * C**-0.5 # (B, T, C) @ (B, C, T) -> (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf")) # (B, T, T)
         wei = F.softmax(wei, dim=-1) # (B, T, T)
-
+        wei = self.dropout(wei)
         # Perform the weighted aggregation of the values
         out = wei @ v # (B, T, T) @ (B, T, C) -> (B, T, C))
         return out
@@ -88,10 +92,11 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(n_heads)])
         self.proj = nn.Linear(n_embeds, n_embeds)
+        self.dropout = nn.Dropout(dropout_prob)
 
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.proj(out)
+        out = self.dropout(self.proj(out))
         return out
     
 class FeedForward(nn.Module):
@@ -101,7 +106,8 @@ class FeedForward(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(n_embeds, 4 * n_embeds),
             nn.ReLU(),
-            nn.Linear(4 * n_embeds, n_embeds)
+            nn.Linear(4 * n_embeds, n_embeds),
+            nn.Dropout(dropout_prob)
         )
 
     def forward(self, x):
@@ -114,10 +120,12 @@ class Block(nn.Module):
         head_size = n_embeds // n_heads
         self.sa = MultiHeadAttention(n_heads, head_size)
         self.ffwd = FeedForward(n_embeds)
+        self.ln1 = nn.LayerNorm(n_embeds)
+        self.ln2 = nn.LayerNorm(n_embeds)
 
     def forward(self, x):
-        x = x + self.sa(x)
-        x = x + self.ffwd(x)
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
         return x
 
 # Simple bigram model
@@ -126,12 +134,8 @@ class BigramLanguageModel(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embeds)
         self.position_embedding_table = nn.Embedding(block_size, n_embeds)
-        self.sa_heads = MultiHeadAttention(4, n_embeds//4)
-        self.blocks = nn.Sequential(
-            Block(n_embeds, n_heads=4),
-            Block(n_embeds, n_heads=4),
-            Block(n_embeds, n_heads=4),
-        )
+        self.blocks = nn.Sequential(*[Block(n_embeds, n_heads=n_heads) for _ in range(n_layers)])
+        self.ln_f = nn.LayerNorm(n_embeds)
         self.lm_head = nn.Linear(n_embeds, vocab_size)
     
     def forward(self, idx, targets=None):
@@ -139,8 +143,8 @@ class BigramLanguageModel(nn.Module):
         token_embeds = self.token_embedding_table(idx) # (B, T, n_embeds)
         position_embeds = self.position_embedding_table(torch.arange(T, device=device)) # T, n_embeds
         x = token_embeds + position_embeds # (B, T, n_embeds)
-        x = self.sa_heads(x) # apply one head of self-attention. (B, T, n_embeds)
         x = self.blocks(x) # (B, T, n_embeds)
+        x = self.ln_f(x) # (B, T, n_embeds)
         logits = self.lm_head(x) # (B, T, vocab_size)
 
         if targets is None:
@@ -169,7 +173,7 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
 # Training loop
 for iter in range(max_iters):
-    if iter % eval_interval == 0:
+    if (iter) % eval_interval == 0:
         losses = estimate_loss()
         print(f"Step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
