@@ -128,8 +128,8 @@ class Block(nn.Module):
         x = x + self.ffwd(self.ln2(x))
         return x
 
-# Simple bigram model
-class BigramLanguageModel(nn.Module):
+# GPT model
+class GPTLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embeds)
@@ -166,7 +166,10 @@ class BigramLanguageModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
     
-model = BigramLanguageModel().to(device)
+model = GPTLanguageModel().to(device)
+
+# Print the number of parameters in the model
+print(sum(p.numel() for p in model.parameters()) / 1e6, "M parameters")
 
 # Create an optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
